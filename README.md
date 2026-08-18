@@ -28,7 +28,7 @@ src/adapters/FewToken4626Adapter.sol
 
 The adapter has no owner, upgrade, rescue, arbitrary call, or vault-switching function. Its FewFactory, FewToken, origin token, and origin vault are immutable.
 
-The constructor rejects mismatched wrappers, factories, assets, decimals, and vaults that report entry or exit fees. Runtime checks fail closed when the origin vault changes its fee behavior, stops serving required views, or lacks synchronous withdrawal capacity. Asset transfers are checked by balance movement and exact wrap or unwrap return values.
+The constructor rejects mismatched wrappers, factories, assets, decimals, and vaults that report entry or exit fees. Runtime checks fail closed when the origin vault changes its fee behavior, stops serving required views, or lacks synchronous withdrawal capacity. Asset transfers are checked by balance movement, exact wrap or unwrap return values, and exact origin-vault share issuance against the pre-deposit preview.
 
 The adapter intentionally supports a narrow vault set:
 

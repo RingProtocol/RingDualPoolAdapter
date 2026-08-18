@@ -189,6 +189,7 @@ contract FewToken4626Adapter is ERC4626, ReentrancyGuard {
     {
         if (assets == 0 || shares == 0) revert ZeroAmount();
         _requireCompatible(_runtimeDepositViewState(assets));
+        uint256 expectedVaultShares = originVault.previewDeposit(assets);
 
         IERC20 wrapped = IERC20(address(fewToken));
         uint256 wrappedBefore = wrapped.balanceOf(address(this));
@@ -209,7 +210,7 @@ contract FewToken4626Adapter is ERC4626, ReentrancyGuard {
         uint256 vaultShares = originVault.deposit(assets, address(this));
         originToken.forceApprove(address(originVault), 0);
         if (
-            vaultShares == 0
+            vaultShares == 0 || vaultShares != expectedVaultShares
                 || originVault.balanceOf(address(this)) != vaultSharesBefore + vaultShares
                 || originToken.balanceOf(address(this)) != originBefore
         ) revert AssetMovementMismatch();

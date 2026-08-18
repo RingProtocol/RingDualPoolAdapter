@@ -117,6 +117,7 @@ contract AdapterMockOriginVault is ERC4626 {
     bool public entryFeeReported;
     bool public exitFeeReported;
     bool public withdrawFeeReported;
+    bool public underMintDeposit;
     bool public underpayWithdraw;
 
     constructor(IERC20 asset_) ERC20("Origin Vault", "vORG") ERC4626(asset_) {}
@@ -161,6 +162,10 @@ contract AdapterMockOriginVault is ERC4626 {
         withdrawFeeReported = enabled;
     }
 
+    function setUnderMintDeposit(bool enabled) external {
+        underMintDeposit = enabled;
+    }
+
     function setUnderpayWithdraw(bool enabled) external {
         underpayWithdraw = enabled;
     }
@@ -197,6 +202,17 @@ contract AdapterMockOriginVault is ERC4626 {
     function previewWithdraw(uint256 assets) public view override returns (uint256) {
         uint256 shares = super.previewWithdraw(assets);
         return withdrawFeeReported && shares != 0 ? shares + 1 : shares;
+    }
+
+    function deposit(uint256 assets, address receiver) public override returns (uint256 shares) {
+        if (!underMintDeposit) return super.deposit(assets, receiver);
+
+        uint256 previewedShares = previewDeposit(assets);
+        require(previewedShares > 1, "insufficient shares");
+        shares = previewedShares - 1;
+        IERC20(asset()).safeTransferFrom(msg.sender, address(this), assets);
+        _mint(receiver, shares);
+        emit Deposit(msg.sender, receiver, assets, shares);
     }
 
     function _withdraw(
@@ -605,6 +621,24 @@ contract FewToken4626AdapterTest is Test {
 
         assertEq(adapter.balanceOf(user), 0);
         assertEq(fewToken.balanceOf(user), assets);
+        assertEq(adapter.totalAssets(), 0);
+    }
+
+    function test_underMintingOriginVaultDepositRevertsAtomically() public {
+        uint256 assets = 100 * UNIT;
+        _mintWrapped(user, assets);
+        originVault.setUnderMintDeposit(true);
+
+        vm.startPrank(user);
+        fewToken.approve(address(adapter), assets);
+        vm.expectRevert(FewToken4626Adapter.AssetMovementMismatch.selector);
+        adapter.deposit(assets, user);
+        vm.stopPrank();
+
+        assertEq(adapter.balanceOf(user), 0);
+        assertEq(fewToken.balanceOf(user), assets);
+        assertEq(origin.balanceOf(address(originVault)), 0);
+        assertEq(origin.allowance(address(adapter), address(originVault)), 0);
         assertEq(adapter.totalAssets(), 0);
     }
 

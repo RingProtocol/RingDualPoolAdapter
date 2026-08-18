@@ -28,7 +28,7 @@ The upstream DualPool audit does not cover the Ring Protocol adapter or the beha
 
 1. `asset()` is the canonical FewToken, and `originVault.asset()` is its origin token.
 2. The contract has no owner, upgrade, rescue, arbitrary call, or mutable vault path.
-3. A deposit completes an exact 1:1 FewToken unwrap and deposits the expected origin assets.
+3. A deposit completes an exact 1:1 FewToken unwrap, deposits the expected origin assets, and receives exactly the previewed origin-vault shares.
 4. A withdrawal synchronously returns the exact FewToken amount or reverts atomically.
 5. Entry fees, exit fees, inconsistent views, underpayment, and unsupported token behavior fail closed.
 6. The adapter never advertises more synchronous withdrawal capacity than it can realize.
