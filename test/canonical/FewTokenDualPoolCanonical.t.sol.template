@@ -1,0 +1,837 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+pragma solidity 0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+
+import {AllowlistedFactory} from "../../src/AllowlistedFactory.sol";
+import {DualPoolHook} from "../../src/alf/DualPoolHook.sol";
+import {InventoryLib} from "../../src/alf/libraries/InventoryLib.sol";
+import {LiquidityBucket} from "../../src/alf/types/Distribution.sol";
+import {HookMiner} from "../../src/utils/HookMiner.sol";
+
+import {FewToken4626Adapter} from "ring-adapter/src/adapters/FewToken4626Adapter.sol";
+import {IFewFactory, IFewWrappedToken} from "ring-adapter/src/interfaces/IFew.sol";
+
+contract CanonicalAdapterToken is ERC20 {
+    uint8 internal immutable _tokenDecimals;
+
+    constructor(string memory name_, string memory symbol_, uint8 decimals_) ERC20(name_, symbol_) {
+        _tokenDecimals = decimals_;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return _tokenDecimals;
+    }
+
+    function mint(address receiver, uint256 amount) external {
+        _mint(receiver, amount);
+    }
+}
+
+contract CanonicalAdapterFewFactory {
+    mapping(address origin => address wrapper) public getWrappedToken;
+
+    function setWrappedToken(address origin, address wrapper) external {
+        getWrappedToken[origin] = wrapper;
+    }
+}
+
+contract CanonicalAdapterFewToken is ERC20 {
+    using SafeERC20 for IERC20;
+
+    IERC20 public immutable token;
+    address public immutable factory;
+    uint8 internal immutable _tokenDecimals;
+
+    constructor(address origin_, address factory_, string memory symbol_, uint8 decimals_)
+        ERC20("Canonical FewToken fixture", symbol_)
+    {
+        token = IERC20(origin_);
+        factory = factory_;
+        _tokenDecimals = decimals_;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return _tokenDecimals;
+    }
+
+    function wrapTo(uint256 amount, address receiver) external returns (uint256) {
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        _mint(receiver, amount);
+        return amount;
+    }
+
+    function unwrapTo(uint256 amount, address receiver) external returns (uint256) {
+        _burn(msg.sender, amount);
+        token.safeTransfer(receiver, amount);
+        return amount;
+    }
+}
+
+contract CanonicalAdapterOriginVault is ERC4626 {
+    uint256 public withdrawCap = type(uint256).max;
+    bool public entryFeeReported;
+    bool public exitFeeReported;
+    bool public withdrawFeeReported;
+
+    constructor(IERC20 asset_, string memory symbol_)
+        ERC20("Origin vault fixture", symbol_)
+        ERC4626(asset_)
+    {}
+
+    function setWithdrawCap(uint256 cap) external {
+        withdrawCap = cap;
+    }
+
+    function setEntryFeeReported(bool enabled) external {
+        entryFeeReported = enabled;
+    }
+
+    function setExitFeeReported(bool enabled) external {
+        exitFeeReported = enabled;
+    }
+
+    function setWithdrawFeeReported(bool enabled) external {
+        withdrawFeeReported = enabled;
+    }
+
+    function maxWithdraw(address owner) public view override returns (uint256) {
+        uint256 claim = super.maxWithdraw(owner);
+        uint256 liquid = IERC20(asset()).balanceOf(address(this));
+        if (claim > liquid) claim = liquid;
+        return claim < withdrawCap ? claim : withdrawCap;
+    }
+
+    function previewDeposit(uint256 assets) public view override returns (uint256) {
+        uint256 shares = super.previewDeposit(assets);
+        return entryFeeReported && shares != 0 ? shares - 1 : shares;
+    }
+
+    function previewRedeem(uint256 shares) public view override returns (uint256) {
+        uint256 assets = super.previewRedeem(shares);
+        return exitFeeReported && assets != 0 ? assets - 1 : assets;
+    }
+
+    function previewWithdraw(uint256 assets) public view override returns (uint256) {
+        uint256 shares = super.previewWithdraw(assets);
+        return withdrawFeeReported && shares != 0 ? shares + 1 : shares;
+    }
+}
+
+contract CanonicalAdapterFeeVault is ERC4626 {
+    bool internal immutable _entryFee;
+    bool internal immutable _exitFee;
+
+    constructor(IERC20 asset_, bool entryFee_, bool exitFee_)
+        ERC20("Fee vault fixture", "feeV")
+        ERC4626(asset_)
+    {
+        _entryFee = entryFee_;
+        _exitFee = exitFee_;
+    }
+
+    function previewDeposit(uint256 assets) public view override returns (uint256) {
+        uint256 shares = super.previewDeposit(assets);
+        return _entryFee && shares != 0 ? shares - 1 : shares;
+    }
+
+    function previewRedeem(uint256 shares) public view override returns (uint256) {
+        uint256 assets = super.previewRedeem(shares);
+        return _exitFee && assets != 0 ? assets - 1 : assets;
+    }
+}
+
+/// @notice Test-only compatibility proof against the pinned canonical DualPool implementation.
+/// @dev This file is copied into a temporary official-source harness by
+///      scripts/test_canonical_dualpool_adapter.sh. It is intentionally not a Ring Foundry test.
+contract FewTokenDualPoolCanonicalTest is Test, Deployers {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    bytes32 internal constant CANONICAL_DUALPOOL_CREATION_HASH =
+        0xb63b7eeaa4c8c264312daacf539b12878b967d01c6be842a6e0c304b8f00affa;
+    uint160 internal constant FLAGS = uint160(
+        Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
+            | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+    uint32 internal constant MAX_GAS = 100_000;
+    uint64 internal constant MAX_MIN_DEPOSIT_BLOCKS = 3_600;
+    uint24 internal constant FEE_PIPS = 1_000;
+    uint256 internal constant UNIT = 1e6;
+    uint256 internal constant BOOTSTRAP = 1_000 * UNIT;
+
+    address internal owner = makeAddr("owner");
+
+    AllowlistedFactory internal canonicalFactory;
+    DualPoolHook internal hook;
+
+    CanonicalAdapterFewFactory internal fewFactory;
+    CanonicalAdapterFewToken internal fewToken0;
+    CanonicalAdapterFewToken internal fewToken1;
+    CanonicalAdapterOriginVault internal originVault0;
+    CanonicalAdapterOriginVault internal originVault1;
+    FewToken4626Adapter internal adapter0;
+    FewToken4626Adapter internal adapter1;
+    CanonicalAdapterToken internal origin0;
+    CanonicalAdapterToken internal origin1;
+
+    function setUp() public {
+        deployFreshManagerAndRouters();
+        _deployAdapterPair();
+        _deployCanonicalHook();
+    }
+
+    function test_canonicalFactory_adapterCompletesInitializeBootstrapTwoWaySwapAndRedeposit()
+        public
+    {
+        PoolKey memory poolKey = _poolKey(FEE_PIPS, 10);
+
+        uint256 gasBefore = gasleft();
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(adapter0)), IERC4626(address(adapter1)))
+        );
+        emit log_named_uint("canonical_initialize_gas", gasBefore - gasleft());
+
+        _mintWrapped(fewToken0, origin0, owner, BOOTSTRAP);
+        _mintWrapped(fewToken1, origin1, owner, BOOTSTRAP);
+        vm.startPrank(owner);
+        fewToken0.approve(address(hook), BOOTSTRAP);
+        fewToken1.approve(address(hook), BOOTSTRAP);
+        gasBefore = gasleft();
+        uint256 poolShares = hook.bootstrap(poolKey, BOOTSTRAP, BOOTSTRAP);
+        emit log_named_uint("canonical_bootstrap_gas", gasBefore - gasleft());
+        vm.stopPrank();
+
+        assertGt(poolShares, 0, "bootstrap shares");
+        assertGt(adapter0.balanceOf(address(hook)), 0, "currency0 adapter shares");
+        assertGt(adapter1.balanceOf(address(hook)), 0, "currency1 adapter shares");
+        assertEq(fewToken0.balanceOf(address(hook)), 0, "currency0 was not deposited");
+        assertEq(fewToken1.balanceOf(address(hook)), 0, "currency1 was not deposited");
+
+        _mintWrapped(fewToken0, origin0, address(this), 100 * UNIT);
+        _mintWrapped(fewToken1, origin1, address(this), 100 * UNIT);
+        fewToken0.approve(address(swapRouter), type(uint256).max);
+        fewToken1.approve(address(swapRouter), type(uint256).max);
+
+        gasBefore = gasleft();
+        swap(poolKey, true, -int256(10 * UNIT), "");
+        emit log_named_uint("canonical_swap_zero_for_one_gas", gasBefore - gasleft());
+        assertEq(manager.getLiquidity(poolKey.toId()), 0, "orphaned JIT liquidity after first swap");
+
+        gasBefore = gasleft();
+        swap(poolKey, false, -int256(10 * UNIT), "");
+        emit log_named_uint("canonical_swap_one_for_zero_gas", gasBefore - gasleft());
+        assertEq(
+            manager.getLiquidity(poolKey.toId()), 0, "orphaned JIT liquidity after second swap"
+        );
+
+        assertGt(adapter0.balanceOf(address(hook)), 0, "currency0 was not re-deposited");
+        assertGt(adapter1.balanceOf(address(hook)), 0, "currency1 was not re-deposited");
+        assertGt(originVault0.balanceOf(address(adapter0)), 0, "currency0 origin vault empty");
+        assertGt(originVault1.balanceOf(address(adapter1)), 0, "currency1 origin vault empty");
+
+        (uint256 reserve0, uint256 reserve1) = hook.getReserves(poolKey);
+        uint256 preview0 = adapter0.convertToAssets(adapter0.balanceOf(address(hook)));
+        uint256 preview1 = adapter1.convertToAssets(adapter1.balanceOf(address(hook)));
+        uint256 adapterAssets0 = adapter0.totalAssets();
+        uint256 adapterAssets1 = adapter1.totalAssets();
+        emit log_named_uint("canonical_pool_shares", poolShares);
+        emit log_named_uint(
+            "currency0_adapter_virtual_share_rounding",
+            adapterAssets0 > preview0 ? adapterAssets0 - preview0 : preview0 - adapterAssets0
+        );
+        emit log_named_uint(
+            "currency1_adapter_virtual_share_rounding",
+            adapterAssets1 > preview1 ? adapterAssets1 - preview1 : preview1 - adapterAssets1
+        );
+        emit log_named_uint(
+            "currency0_non_adapter_inventory", reserve0 > preview0 ? reserve0 - preview0 : 0
+        );
+        emit log_named_uint(
+            "currency1_non_adapter_inventory", reserve1 > preview1 ? reserve1 - preview1 : 0
+        );
+    }
+
+    function test_initialize_rejectsOriginVaultAssetMismatch() public {
+        PoolKey memory poolKey = _poolKey(FEE_PIPS, 10);
+
+        vm.expectRevert(DualPoolHook.VaultAssetMismatch.selector);
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(originVault0)), IERC4626(address(adapter1)))
+        );
+    }
+
+    function test_initialize_rejectsEntryFeeVault() public {
+        PoolKey memory poolKey = _poolKey(FEE_PIPS, 10);
+        CanonicalAdapterFeeVault feeVault =
+            new CanonicalAdapterFeeVault(IERC20(address(fewToken0)), true, false);
+
+        vm.expectRevert(InventoryLib.VaultChargesEntryFee.selector);
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(feeVault)), IERC4626(address(adapter1)))
+        );
+    }
+
+    function test_initialize_rejectsExitFeeVault() public {
+        PoolKey memory poolKey = _poolKey(FEE_PIPS, 10);
+        CanonicalAdapterFeeVault feeVault =
+            new CanonicalAdapterFeeVault(IERC20(address(fewToken0)), false, true);
+
+        vm.expectRevert(InventoryLib.VaultChargesExitFee.selector);
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(feeVault)), IERC4626(address(adapter1)))
+        );
+    }
+
+    function test_zeroImmediateWithdraw_failsClosedAfterBootstrap() public {
+        PoolKey memory poolKey = _poolKey(FEE_PIPS, 10);
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(adapter0)), IERC4626(address(adapter1)))
+        );
+
+        _mintWrapped(fewToken0, origin0, owner, BOOTSTRAP);
+        _mintWrapped(fewToken1, origin1, owner, BOOTSTRAP);
+        vm.startPrank(owner);
+        fewToken0.approve(address(hook), BOOTSTRAP);
+        fewToken1.approve(address(hook), BOOTSTRAP);
+        hook.bootstrap(poolKey, BOOTSTRAP, BOOTSTRAP);
+        vm.stopPrank();
+
+        uint256 originShares0 = originVault0.balanceOf(address(adapter0));
+        uint256 originShares1 = originVault1.balanceOf(address(adapter1));
+        originVault0.setWithdrawCap(0);
+        originVault1.setWithdrawCap(0);
+
+        vm.expectRevert(FewToken4626Adapter.SynchronousLiquidityUnavailable.selector);
+        adapter0.maxWithdraw(address(hook));
+        vm.expectRevert(FewToken4626Adapter.SynchronousLiquidityUnavailable.selector);
+        adapter1.maxWithdraw(address(hook));
+        vm.expectRevert(FewToken4626Adapter.SynchronousLiquidityUnavailable.selector);
+        hook.getEffectiveLiquidity(poolKey);
+        vm.expectRevert(FewToken4626Adapter.SynchronousLiquidityUnavailable.selector);
+        hook.getIndicativeQuote(poolKey, true, -int256(UNIT), "");
+
+        assertEq(
+            originVault0.balanceOf(address(adapter0)), originShares0, "currency0 principal moved"
+        );
+        assertEq(
+            originVault1.balanceOf(address(adapter1)), originShares1, "currency1 principal moved"
+        );
+    }
+
+    function test_zeroCapacityBeforeBootstrap_revertsAtomically() public {
+        PoolKey memory poolKey = _poolKey(FEE_PIPS, 10);
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(adapter0)), IERC4626(address(adapter1)))
+        );
+
+        originVault0.setWithdrawCap(0);
+        originVault1.setWithdrawCap(0);
+        _mintWrapped(fewToken0, origin0, owner, BOOTSTRAP);
+        _mintWrapped(fewToken1, origin1, owner, BOOTSTRAP);
+        vm.startPrank(owner);
+        fewToken0.approve(address(hook), BOOTSTRAP);
+        fewToken1.approve(address(hook), BOOTSTRAP);
+        vm.expectRevert(FewToken4626Adapter.SynchronousLiquidityUnavailable.selector);
+        hook.bootstrap(poolKey, BOOTSTRAP, BOOTSTRAP);
+        vm.stopPrank();
+
+        assertEq(hook.totalShares(poolKey.toId()), 0, "pool shares minted");
+        assertEq(hook.userShares(poolKey.toId(), owner), 0, "owner shares minted");
+        assertEq(adapter0.balanceOf(address(hook)), 0, "adapter0 shares minted");
+        assertEq(adapter1.balanceOf(address(hook)), 0, "adapter1 shares minted");
+        assertEq(originVault0.balanceOf(address(adapter0)), 0, "vault0 retained principal");
+        assertEq(originVault1.balanceOf(address(adapter1)), 0, "vault1 retained principal");
+        assertEq(fewToken0.balanceOf(owner), BOOTSTRAP, "owner currency0 moved");
+        assertEq(fewToken1.balanceOf(owner), BOOTSTRAP, "owner currency1 moved");
+    }
+
+    function test_zeroCapacityForcedZeroForOne_revertsBeforeCoreAndRecovers() public {
+        _assertZeroCapacityPreCoreRevertAndRecovery(true);
+    }
+
+    function test_zeroCapacityForcedOneForZero_revertsBeforeCoreAndRecovers() public {
+        _assertZeroCapacityPreCoreRevertAndRecovery(false);
+    }
+
+    function test_partialCapacityAndDirectBuffersReportOnlyRealizableLiquidity() public {
+        (PoolKey memory poolKey,) = _initializeAndBootstrap();
+        originVault0.setWithdrawCap(100 * UNIT);
+        originVault1.setWithdrawCap(80 * UNIT);
+        origin0.mint(address(adapter0), 5 * UNIT);
+        _mintWrapped(fewToken0, origin0, address(adapter0), 7 * UNIT);
+
+        assertEq(adapter0.maxWithdraw(address(hook)), 112 * UNIT, "adapter0 realizable amount");
+        assertEq(adapter1.maxWithdraw(address(hook)), 80 * UNIT, "adapter1 realizable amount");
+        (uint256 effective0, uint256 effective1) = hook.getEffectiveLiquidity(poolKey);
+        assertEq(effective0, 112 * UNIT, "hook overstated currency0");
+        assertEq(effective1, 80 * UNIT, "hook overstated currency1");
+
+        uint256 quote0 = hook.getIndicativeQuote(poolKey, true, -int256(UNIT), "");
+        uint256 quote1 = hook.getIndicativeQuote(poolKey, false, -int256(UNIT), "");
+        assertGt(quote0, 0, "zeroForOne partial quote");
+        assertGt(quote1, 0, "oneForZero partial quote");
+        assertLe(quote0, effective1, "zeroForOne exceeds realizable output");
+        assertLe(quote1, effective0, "oneForZero exceeds realizable output");
+    }
+
+    function test_runtimeExitAndWithdrawOnlyFees_revertBeforeCoreAndRecover() public {
+        (PoolKey memory poolKey,) = _initializeAndBootstrap();
+        _mintWrapped(fewToken0, origin0, address(this), 10 * UNIT);
+        _mintWrapped(fewToken1, origin1, address(this), 10 * UNIT);
+        fewToken0.approve(address(swapRouter), type(uint256).max);
+        fewToken1.approve(address(swapRouter), type(uint256).max);
+
+        originVault0.setExitFeeReported(true);
+        originVault1.setExitFeeReported(true);
+        _assertRuntimeExitFailClosed(poolKey);
+        _assertForcedExtremeSwapsRevertWithoutStateChange(poolKey, "exit fee");
+
+        originVault0.setExitFeeReported(false);
+        originVault1.setExitFeeReported(false);
+        _assertRuntimeExitRecovered(poolKey, "exit fee recovery");
+        _assertRecoveredRoundTrip(poolKey, "exit fee recovery");
+
+        originVault0.setWithdrawFeeReported(true);
+        originVault1.setWithdrawFeeReported(true);
+        _assertRuntimeExitFailClosed(poolKey);
+        _assertForcedExtremeSwapsRevertWithoutStateChange(poolKey, "withdraw-only fee");
+
+        originVault0.setWithdrawFeeReported(false);
+        originVault1.setWithdrawFeeReported(false);
+        _assertRuntimeExitRecovered(poolKey, "withdraw-only fee recovery");
+        _assertRecoveredRoundTrip(poolKey, "withdraw-only fee recovery");
+    }
+
+    function test_runtimeEntryFee_viewsLpDepositTryDepositAllAtomicAndRecover() public {
+        (PoolKey memory poolKey,) = _initializeAndBootstrap();
+        originVault0.setEntryFeeReported(true);
+        originVault1.setEntryFeeReported(true);
+
+        assertEq(adapter0.maxDeposit(address(hook)), 0, "adapter0 maxDeposit");
+        assertEq(adapter1.maxDeposit(address(hook)), 0, "adapter1 maxDeposit");
+        assertEq(adapter0.maxMint(address(hook)), 0, "adapter0 maxMint");
+        assertEq(adapter1.maxMint(address(hook)), 0, "adapter1 maxMint");
+        assertEq(adapter0.previewDeposit(UNIT), 0, "adapter0 previewDeposit");
+        assertEq(adapter1.previewDeposit(UNIT), 0, "adapter1 previewDeposit");
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter0.previewMint(UNIT);
+
+        uint256 sharesToMint = hook.totalShares(poolKey.toId()) / 100;
+        (uint256 amount0, uint256 amount1) = hook.previewDeposit(poolKey, sharesToMint);
+        _mintWrapped(fewToken0, origin0, owner, amount0);
+        _mintWrapped(fewToken1, origin1, owner, amount1);
+        vm.startPrank(owner);
+        fewToken0.approve(address(hook), amount0);
+        fewToken1.approve(address(hook), amount1);
+        vm.stopPrank();
+
+        uint256 owner0Before = fewToken0.balanceOf(owner);
+        uint256 owner1Before = fewToken1.balanceOf(owner);
+        uint256 poolSharesBefore = hook.userShares(poolKey.toId(), owner);
+        uint256 adapterShares0Before = adapter0.balanceOf(address(hook));
+        uint256 adapterShares1Before = adapter1.balanceOf(address(hook));
+        uint256 vaultAssets0Before = origin0.balanceOf(address(originVault0));
+        uint256 vaultAssets1Before = origin1.balanceOf(address(originVault1));
+
+        vm.prank(owner);
+        vm.expectRevert();
+        hook.addLiquidity(poolKey, sharesToMint, amount0, amount1, block.timestamp);
+
+        assertEq(fewToken0.balanceOf(owner), owner0Before, "LP currency0 moved");
+        assertEq(fewToken1.balanceOf(owner), owner1Before, "LP currency1 moved");
+        assertEq(hook.userShares(poolKey.toId(), owner), poolSharesBefore, "LP shares changed");
+        assertEq(adapter0.balanceOf(address(hook)), adapterShares0Before, "adapter0 shares changed");
+        assertEq(adapter1.balanceOf(address(hook)), adapterShares1Before, "adapter1 shares changed");
+        assertEq(
+            origin0.balanceOf(address(originVault0)), vaultAssets0Before, "vault0 assets changed"
+        );
+        assertEq(
+            origin1.balanceOf(address(originVault1)), vaultAssets1Before, "vault1 assets changed"
+        );
+        assertEq(
+            origin0.allowance(address(adapter0), address(originVault0)), 0, "adapter0 allowance"
+        );
+        assertEq(
+            origin1.allowance(address(adapter1), address(originVault1)), 0, "adapter1 allowance"
+        );
+
+        _mintWrapped(fewToken0, origin0, address(this), 10 * UNIT);
+        _mintWrapped(fewToken1, origin1, address(this), 10 * UNIT);
+        fewToken0.approve(address(swapRouter), type(uint256).max);
+        fewToken1.approve(address(swapRouter), type(uint256).max);
+        assertGt(
+            hook.getIndicativeQuote(poolKey, true, -int256(UNIT), ""),
+            0,
+            "entry fee blocked exit quote"
+        );
+        swap(poolKey, true, -int256(UNIT), "");
+
+        uint256 raw0AfterSkippedDeposit = fewToken0.balanceOf(address(hook));
+        uint256 raw1AfterSkippedDeposit = fewToken1.balanceOf(address(hook));
+        assertGt(
+            raw0AfterSkippedDeposit + raw1AfterSkippedDeposit,
+            0,
+            "tryDepositAll did not retain raw assets"
+        );
+        assertEq(fewToken0.balanceOf(address(adapter0)), 0, "adapter0 retained FewToken");
+        assertEq(fewToken1.balanceOf(address(adapter1)), 0, "adapter1 retained FewToken");
+        assertEq(origin0.balanceOf(address(adapter0)), 0, "adapter0 retained origin");
+        assertEq(origin1.balanceOf(address(adapter1)), 0, "adapter1 retained origin");
+        assertEq(
+            origin0.allowance(address(adapter0), address(originVault0)),
+            0,
+            "adapter0 leaked allowance"
+        );
+        assertEq(
+            origin1.allowance(address(adapter1), address(originVault1)),
+            0,
+            "adapter1 leaked allowance"
+        );
+
+        originVault0.setEntryFeeReported(false);
+        originVault1.setEntryFeeReported(false);
+        assertGt(adapter0.maxDeposit(address(hook)), 0, "adapter0 did not recover");
+        assertGt(adapter1.maxDeposit(address(hook)), 0, "adapter1 did not recover");
+        assertGt(adapter0.previewDeposit(UNIT), 0, "adapter0 preview did not recover");
+        assertGt(adapter1.previewDeposit(UNIT), 0, "adapter1 preview did not recover");
+
+        swap(poolKey, false, -int256(UNIT), "");
+        assertLt(
+            fewToken0.balanceOf(address(hook)) + fewToken1.balanceOf(address(hook)),
+            raw0AfterSkippedDeposit + raw1AfterSkippedDeposit,
+            "raw inventory was not retried"
+        );
+    }
+
+    function _assertRuntimeExitFailClosed(PoolKey memory poolKey) internal {
+        uint256 shares0 = adapter0.balanceOf(address(hook));
+        uint256 shares1 = adapter1.balanceOf(address(hook));
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter0.maxWithdraw(address(hook));
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter1.maxWithdraw(address(hook));
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter0.maxRedeem(address(hook));
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter1.maxRedeem(address(hook));
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter0.previewRedeem(shares0);
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        adapter1.previewRedeem(shares1);
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        hook.getEffectiveLiquidity(poolKey);
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        hook.getIndicativeQuote(poolKey, true, -int256(UNIT), "");
+        vm.expectRevert(FewToken4626Adapter.OriginVaultFeeDetected.selector);
+        hook.getIndicativeQuote(poolKey, false, -int256(UNIT), "");
+    }
+
+    function _assertRuntimeExitRecovered(PoolKey memory poolKey, string memory reason)
+        internal
+        view
+    {
+        assertGt(adapter0.maxWithdraw(address(hook)), 0, string.concat(reason, " adapter0"));
+        assertGt(adapter1.maxWithdraw(address(hook)), 0, string.concat(reason, " adapter1"));
+        (uint256 effective0, uint256 effective1) = hook.getEffectiveLiquidity(poolKey);
+        assertGt(effective0, 0, string.concat(reason, " effective0"));
+        assertGt(effective1, 0, string.concat(reason, " effective1"));
+        assertGt(
+            hook.getIndicativeQuote(poolKey, true, -int256(UNIT), ""),
+            0,
+            string.concat(reason, " zeroForOne quote")
+        );
+        assertGt(
+            hook.getIndicativeQuote(poolKey, false, -int256(UNIT), ""),
+            0,
+            string.concat(reason, " oneForZero quote")
+        );
+    }
+
+    function _assertForcedExtremeSwapsRevertWithoutStateChange(
+        PoolKey memory poolKey,
+        string memory reason
+    ) internal {
+        bytes32 stateBefore = _runtimeStateHash(poolKey);
+
+        // Deployers.swap uses MIN_SQRT_PRICE + 1 for zeroForOne and MAX_SQRT_PRICE - 1 for
+        // oneForZero. Both extreme-limit attempts must fail in the hook before v4 core mutates.
+        vm.expectRevert();
+        swap(poolKey, true, -int256(UNIT), "");
+        assertEq(
+            _runtimeStateHash(poolKey), stateBefore, string.concat(reason, " zeroForOne state")
+        );
+
+        vm.expectRevert();
+        swap(poolKey, false, -int256(UNIT), "");
+        assertEq(
+            _runtimeStateHash(poolKey), stateBefore, string.concat(reason, " oneForZero state")
+        );
+    }
+
+    function _assertRecoveredRoundTrip(PoolKey memory poolKey, string memory reason) internal {
+        uint256 trader0Before = fewToken0.balanceOf(address(this));
+        uint256 trader1Before = fewToken1.balanceOf(address(this));
+        uint256 quote0 = hook.getIndicativeQuote(poolKey, true, -int256(UNIT), "");
+
+        swap(poolKey, true, -int256(UNIT), "");
+        uint256 trader0Middle = fewToken0.balanceOf(address(this));
+        uint256 trader1Middle = fewToken1.balanceOf(address(this));
+        assertEq(trader0Before - trader0Middle, UNIT, string.concat(reason, " zeroForOne input"));
+        uint256 output1 = trader1Middle - trader1Before;
+        assertGt(output1, 0, string.concat(reason, " zeroForOne output"));
+        assertLe(output1, quote0, string.concat(reason, " zeroForOne quote bound"));
+
+        uint256 quote1 = hook.getIndicativeQuote(poolKey, false, -int256(UNIT), "");
+        swap(poolKey, false, -int256(UNIT), "");
+        uint256 trader0After = fewToken0.balanceOf(address(this));
+        uint256 trader1After = fewToken1.balanceOf(address(this));
+        assertEq(trader1Middle - trader1After, UNIT, string.concat(reason, " oneForZero input"));
+        uint256 output0 = trader0After - trader0Middle;
+        assertGt(output0, 0, string.concat(reason, " oneForZero output"));
+        assertLe(output0, quote1, string.concat(reason, " oneForZero quote bound"));
+        assertLe(
+            trader0After + trader1After,
+            trader0Before + trader1Before,
+            string.concat(reason, " profitable round trip")
+        );
+        assertEq(
+            origin0.balanceOf(address(fewToken0)), fewToken0.totalSupply(), "fewToken0 backing"
+        );
+        assertEq(
+            origin1.balanceOf(address(fewToken1)), fewToken1.totalSupply(), "fewToken1 backing"
+        );
+        assertEq(manager.getLiquidity(poolKey.toId()), 0, "orphaned recovered JIT liquidity");
+    }
+
+    function _assertZeroCapacityPreCoreRevertAndRecovery(bool zeroForOne) internal {
+        (PoolKey memory poolKey,) = _initializeAndBootstrap();
+        originVault0.setWithdrawCap(0);
+        originVault1.setWithdrawCap(0);
+        vm.expectRevert(FewToken4626Adapter.SynchronousLiquidityUnavailable.selector);
+        hook.getIndicativeQuote(poolKey, zeroForOne, -int256(UNIT), "");
+
+        _mintWrapped(fewToken0, origin0, address(this), UNIT);
+        _mintWrapped(fewToken1, origin1, address(this), UNIT);
+        fewToken0.approve(address(swapRouter), type(uint256).max);
+        fewToken1.approve(address(swapRouter), type(uint256).max);
+
+        bytes32 stateBefore = _runtimeStateHash(poolKey);
+        vm.expectRevert();
+        swap(poolKey, zeroForOne, -int256(UNIT), "");
+        assertEq(_runtimeStateHash(poolKey), stateBefore, "zero-cap forced swap changed state");
+
+        originVault0.setWithdrawCap(type(uint256).max);
+        originVault1.setWithdrawCap(type(uint256).max);
+        _assertRuntimeExitRecovered(poolKey, "capacity recovery");
+
+        uint256 inputBefore =
+            zeroForOne ? fewToken0.balanceOf(address(this)) : fewToken1.balanceOf(address(this));
+        uint256 outputBefore =
+            zeroForOne ? fewToken1.balanceOf(address(this)) : fewToken0.balanceOf(address(this));
+        uint256 quote = hook.getIndicativeQuote(poolKey, zeroForOne, -int256(UNIT), "");
+        swap(poolKey, zeroForOne, -int256(UNIT), "");
+        uint256 inputAfter =
+            zeroForOne ? fewToken0.balanceOf(address(this)) : fewToken1.balanceOf(address(this));
+        uint256 outputAfter =
+            zeroForOne ? fewToken1.balanceOf(address(this)) : fewToken0.balanceOf(address(this));
+        assertEq(inputBefore - inputAfter, UNIT, "recovered input");
+        assertGt(outputAfter - outputBefore, 0, "recovered output");
+        assertLe(outputAfter - outputBefore, quote, "recovered quote bound");
+    }
+
+    function _inventoryStateHash(PoolKey memory poolKey) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                fewToken0.balanceOf(address(this)),
+                fewToken1.balanceOf(address(this)),
+                fewToken0.balanceOf(address(hook)),
+                fewToken1.balanceOf(address(hook)),
+                adapter0.balanceOf(address(hook)),
+                adapter1.balanceOf(address(hook)),
+                originVault0.balanceOf(address(adapter0)),
+                originVault1.balanceOf(address(adapter1)),
+                hook.userShares(poolKey.toId(), owner)
+            )
+        );
+    }
+
+    function _runtimeStateHash(PoolKey memory poolKey) internal view returns (bytes32) {
+        (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee) =
+            manager.getSlot0(poolKey.toId());
+        return keccak256(
+            abi.encode(
+                sqrtPriceX96,
+                tick,
+                protocolFee,
+                lpFee,
+                manager.getLiquidity(poolKey.toId()),
+                _inventoryStateHash(poolKey)
+            )
+        );
+    }
+
+    function _initializeAndBootstrap()
+        internal
+        returns (PoolKey memory poolKey, uint256 poolShares)
+    {
+        poolKey = _poolKey(FEE_PIPS, 10);
+        vm.prank(owner);
+        hook.initializePool(
+            poolKey, _config(IERC4626(address(adapter0)), IERC4626(address(adapter1)))
+        );
+
+        _mintWrapped(fewToken0, origin0, owner, BOOTSTRAP);
+        _mintWrapped(fewToken1, origin1, owner, BOOTSTRAP);
+        vm.startPrank(owner);
+        fewToken0.approve(address(hook), BOOTSTRAP);
+        fewToken1.approve(address(hook), BOOTSTRAP);
+        poolShares = hook.bootstrap(poolKey, BOOTSTRAP, BOOTSTRAP);
+        vm.stopPrank();
+    }
+
+    function _deployAdapterPair() internal {
+        fewFactory = new CanonicalAdapterFewFactory();
+
+        CanonicalAdapterToken originA = new CanonicalAdapterToken("Origin A", "ORGA", 6);
+        CanonicalAdapterToken originB = new CanonicalAdapterToken("Origin B", "ORGB", 6);
+        CanonicalAdapterFewToken fewA =
+            new CanonicalAdapterFewToken(address(originA), address(fewFactory), "fwA", 6);
+        CanonicalAdapterFewToken fewB =
+            new CanonicalAdapterFewToken(address(originB), address(fewFactory), "fwB", 6);
+        fewFactory.setWrappedToken(address(originA), address(fewA));
+        fewFactory.setWrappedToken(address(originB), address(fewB));
+
+        CanonicalAdapterOriginVault vaultA =
+            new CanonicalAdapterOriginVault(IERC20(address(originA)), "vORGA");
+        CanonicalAdapterOriginVault vaultB =
+            new CanonicalAdapterOriginVault(IERC20(address(originB)), "vORGB");
+        FewToken4626Adapter adapterA = new FewToken4626Adapter(
+            IFewFactory(address(fewFactory)),
+            IFewWrappedToken(address(fewA)),
+            IERC20(address(originA)),
+            IERC4626(address(vaultA)),
+            "Few adapter A",
+            "aFwA"
+        );
+        FewToken4626Adapter adapterB = new FewToken4626Adapter(
+            IFewFactory(address(fewFactory)),
+            IFewWrappedToken(address(fewB)),
+            IERC20(address(originB)),
+            IERC4626(address(vaultB)),
+            "Few adapter B",
+            "aFwB"
+        );
+
+        if (address(fewA) < address(fewB)) {
+            fewToken0 = fewA;
+            fewToken1 = fewB;
+            origin0 = originA;
+            origin1 = originB;
+            originVault0 = vaultA;
+            originVault1 = vaultB;
+            adapter0 = adapterA;
+            adapter1 = adapterB;
+        } else {
+            fewToken0 = fewB;
+            fewToken1 = fewA;
+            origin0 = originB;
+            origin1 = originA;
+            originVault0 = vaultB;
+            originVault1 = vaultA;
+            adapter0 = adapterB;
+            adapter1 = adapterA;
+        }
+
+        currency0 = Currency.wrap(address(fewToken0));
+        currency1 = Currency.wrap(address(fewToken1));
+    }
+
+    function _deployCanonicalHook() internal {
+        bytes memory creationCode = type(DualPoolHook).creationCode;
+        bytes32 creationHash = keccak256(creationCode);
+        assertEq(creationHash, CANONICAL_DUALPOOL_CREATION_HASH, "canonical DualPool build drift");
+
+        bytes32[] memory allowed = new bytes32[](1);
+        allowed[0] = creationHash;
+        canonicalFactory = new AllowlistedFactory(allowed);
+
+        bytes memory constructorArgs = abi.encode(manager, MAX_GAS, owner, MAX_MIN_DEPOSIT_BLOCKS);
+        (address expected, bytes32 salt) =
+            HookMiner.find(address(canonicalFactory), FLAGS, creationCode, constructorArgs);
+
+        uint256 gasBefore = gasleft();
+        address hookAddress = canonicalFactory.deploy(creationCode, constructorArgs, salt);
+        emit log_named_uint("canonical_factory_deploy_gas", gasBefore - gasleft());
+
+        assertEq(hookAddress, expected, "CREATE2 address");
+        assertTrue(canonicalFactory.isFromFactory(hookAddress), "factory provenance");
+        assertEq(
+            canonicalFactory.creationCodeHashOf(hookAddress),
+            creationHash,
+            "creation hash provenance"
+        );
+        assertEq(uint160(hookAddress) & HookMiner.FLAG_MASK, FLAGS, "hook permission bits");
+        hook = DualPoolHook(hookAddress);
+    }
+
+    function _poolKey(uint24 fee, int24 tickSpacing) internal view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: fee,
+            tickSpacing: tickSpacing,
+            hooks: IHooks(address(hook))
+        });
+    }
+
+    function _config(IERC4626 vault0, IERC4626 vault1)
+        internal
+        pure
+        returns (DualPoolHook.PoolConfig memory)
+    {
+        LiquidityBucket[] memory distribution = new LiquidityBucket[](1);
+        distribution[0] = LiquidityBucket({tickLower: -600, tickUpper: 600, weightBps: 10_000});
+        return DualPoolHook.PoolConfig({
+            sqrtPriceX96: TickMath.getSqrtPriceAtTick(0),
+            distribution: distribution,
+            allowExternalDeposits: false,
+            vault0: vault0,
+            vault1: vault1,
+            minDepositBlocks: 0
+        });
+    }
+
+    function _mintWrapped(
+        CanonicalAdapterFewToken fewToken,
+        CanonicalAdapterToken origin,
+        address receiver,
+        uint256 amount
+    ) internal {
+        origin.mint(receiver, amount);
+        vm.startPrank(receiver);
+        origin.approve(address(fewToken), amount);
+        fewToken.wrapTo(amount, receiver);
+        vm.stopPrank();
+    }
+}

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-surface:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check public release surface
+        run: ./scripts/check_public_release.sh
+
+  foundry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout fixed dependencies
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Initialize canonical DualPool test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C lib/v4-hooks-public submodule update --init \
+            lib/blocknumberish lib/forge-std lib/openzeppelin-contracts \
+            lib/solady lib/v4-core lib/v4-periphery
+          git -C lib/v4-hooks-public/lib/v4-core submodule update --init lib/solmate
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
+        with:
+          version: v1.5.1
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Build production contract and enforce size limit
+        run: forge build --sizes --skip test
+
+      - name: Lint production contract
+        run: forge lint src/adapters/FewToken4626Adapter.sol --severity high med
+
+      - name: Run unit, fuzz, and invariant tests
+        run: forge test --offline --match-path test/FewToken4626Adapter.t.sol --threads 1
+
+      - name: Run canonical DualPool integration tests
+        run: ./scripts/test_canonical_dualpool_adapter.sh
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script_file in scripts/*.sh; do
+            bash -n "${script_file}"
+          done
