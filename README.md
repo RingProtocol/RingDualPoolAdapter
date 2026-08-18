@@ -93,4 +93,4 @@ Do not report suspected vulnerabilities in a public issue. Follow [SECURITY.md](
 
 ## License
 
-Ring Protocol source in this repository is licensed under AGPL-3.0-or-later. The pinned Uniswap, OpenZeppelin, and Foundry dependencies retain their upstream licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Ring Protocol source in this repository is licensed under the MIT License. The pinned Uniswap, OpenZeppelin, and Foundry dependencies retain their upstream licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

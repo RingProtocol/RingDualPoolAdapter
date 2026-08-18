@@ -1,5 +1,7 @@
 # Third-party notices
 
+Ring Protocol-authored source is licensed under the repository's MIT License. The dependencies below retain their upstream licenses.
+
 ## Uniswap canonical DualPool
 
 This repository pins `Uniswap/v4-hooks-public` at commit `ffd7f8a8d1f5df5deb6f41c8d2ba99d118244ed6` under `lib/v4-hooks-public`.

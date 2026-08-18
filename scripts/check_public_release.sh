@@ -59,8 +59,22 @@ expected_dualpool="ffd7f8a8d1f5df5deb6f41c8d2ba99d118244ed6"
 [[ "$(git ls-files -s lib/openzeppelin-contracts | awk '{print $2}')" == "${expected_openzeppelin}" ]]
 [[ "$(git ls-files -s lib/v4-hooks-public | awk '{print $2}')" == "${expected_dualpool}" ]]
 
-for file in src/adapters/FewToken4626Adapter.sol src/interfaces/IFew.sol; do
-  head -n 1 "${file}" | grep -Fqx '// SPDX-License-Identifier: AGPL-3.0-or-later'
+ring_owned_files=(
+  src/adapters/FewToken4626Adapter.sol
+  src/interfaces/IFew.sol
+  test/FewToken4626Adapter.t.sol
+  test/canonical/FewTokenDualPoolCanonical.t.sol.template
+)
+
+for file in "${ring_owned_files[@]}"; do
+  head -n 1 "${file}" | grep -Fqx '// SPDX-License-Identifier: MIT'
 done
+
+head -n 1 LICENSE | grep -Fqx 'MIT License'
+
+if git grep -n -I -E '(AGPL-3\.0|GNU Affero)' -- . ':!scripts/check_public_release.sh'; then
+  echo "stale AGPL license reference found" >&2
+  exit 1
+fi
 
 echo "public release surface verified"
